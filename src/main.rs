@@ -1,3 +1,4 @@
+mod animal;
 mod app;
 mod event;
 mod orc;

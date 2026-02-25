@@ -9,16 +9,14 @@ use crate::orc::Activity;
 use crate::world::{MAP_HEIGHT, MAP_WIDTH};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
-    // Main layout: map on left, sidebar on right
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(20),
-            Constraint::Length(30),
+            Constraint::Length(32),
         ])
         .split(frame.area());
 
-    // Left side: map on top, event log on bottom
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -35,11 +33,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_map(frame: &mut Frame, app: &mut App, area: Rect) {
     let night_dim = app.is_night();
 
-    // Viewport dimensions (inside borders)
     let vw = (area.width.saturating_sub(2)) as usize;
     let vh = (area.height.saturating_sub(2)) as usize;
 
-    // Update camera to center on cursor
     app.update_camera(vw, vh);
 
     let cam_x = app.camera_x;
@@ -50,23 +46,45 @@ fn render_map(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut spans: Vec<Span> = Vec::new();
         for x in cam_x..(cam_x + vw).min(MAP_WIDTH) {
             // Check if an orc is here
-            if let Some(orc) = app.orcs.iter().find(|o| o.x == x && o.y == y) {
-                let orc_char = match &orc.activity {
-                    Activity::Sleeping => '◎',
-                    _ => '☻',
-                };
-                let selected = app.selected_orc.is_some_and(|i| {
-                    app.orcs[i].x == x && app.orcs[i].y == y
-                });
-                let color = if selected { Color::White } else { Color::LightGreen };
-                let style = if selected {
-                    Style::default().fg(color).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            if let Some((idx, orc)) = app.orcs.iter().enumerate().find(|(_, o)| o.x == x && o.y == y) {
+                if !orc.alive {
+                    // Dead orc tombstone
+                    spans.push(Span::styled("†", Style::default().fg(Color::DarkGray)));
                 } else {
-                    Style::default().fg(color).add_modifier(Modifier::BOLD)
-                };
-                spans.push(Span::styled(orc_char.to_string(), style));
+                    let orc_char = match &orc.activity {
+                        Activity::Sleeping => '◎',
+                        Activity::Hunting { .. } => '⚔',
+                        Activity::CarryingMeat => '☻',
+                        _ => '☻',
+                    };
+                    let selected = app.selected_orc == Some(idx);
+                    let color = if orc.health < 30.0 {
+                        Color::Red
+                    } else if selected {
+                        Color::White
+                    } else if orc.carrying_food {
+                        Color::Rgb(180, 120, 60)
+                    } else {
+                        Color::LightGreen
+                    };
+                    let style = if selected {
+                        Style::default().fg(color).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    } else {
+                        Style::default().fg(color).add_modifier(Modifier::BOLD)
+                    };
+                    spans.push(Span::styled(orc_char.to_string(), style));
+                }
+            } else if let Some(animal) = app.animals.iter().find(|a| a.alive && a.x == x && a.y == y) {
+                // Render animal
+                let mut color = animal.kind.color();
+                if night_dim {
+                    color = dim_color(color);
+                }
+                spans.push(Span::styled(
+                    animal.kind.symbol().to_string(),
+                    Style::default().fg(color),
+                ));
             } else if app.cursor_x == x && app.cursor_y == y {
-                // Cursor
                 spans.push(Span::styled(
                     "▣",
                     Style::default().fg(Color::White).add_modifier(Modifier::REVERSED),
@@ -88,11 +106,13 @@ fn render_map(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let time_label = if app.is_night() { "Night" } else { "Day" };
     let day_num = app.tick / 100 + 1;
+    let alive_count = app.orcs.iter().filter(|o| o.alive).count();
     let title = format!(
-        " Orc Village | Day {} ({}) | Tick {} | Speed: {}x {} | ({},{}) ",
+        " Orc Village | Day {} ({}) | Pop: {} | Meat: {} | Speed: {}x {} | ({},{}) ",
         day_num,
         time_label,
-        app.tick,
+        alive_count,
+        app.world.food_stockpile,
         app.speed,
         if app.paused { "[PAUSED]" } else { "" },
         app.cursor_x,
@@ -137,15 +157,23 @@ fn render_event_log(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    // Split sidebar into orc list + help
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(10), Constraint::Length(8)])
+        .constraints([Constraint::Min(10), Constraint::Length(9)])
         .split(area);
 
     // Orc details
     let mut items: Vec<ListItem> = Vec::new();
     for (i, orc) in app.orcs.iter().enumerate() {
+        if !orc.alive {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(&orc.name, Style::default().fg(Color::DarkGray)),
+                Span::styled(" (Dead)", Style::default().fg(Color::Red)),
+            ])));
+            continue;
+        }
+
         let selected = app.selected_orc == Some(i);
         let name_style = if selected {
             Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
@@ -153,11 +181,15 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Green)
         };
 
-        let hunger_bar = bar(orc.hunger, 100.0, 8);
-        let energy_bar = bar(orc.energy, 100.0, 8);
+        let health_bar = bar(orc.health, 100.0, 6);
+        let hunger_bar = bar(orc.hunger, 100.0, 6);
+        let energy_bar = bar(orc.energy, 100.0, 6);
+        let thirst_bar = bar(orc.thirst, 100.0, 6);
 
+        let health_color = if orc.health < 30.0 { Color::Red } else if orc.health < 60.0 { Color::Yellow } else { Color::Green };
         let hunger_color = if orc.hunger > 70.0 { Color::Red } else if orc.hunger > 40.0 { Color::Yellow } else { Color::Green };
         let energy_color = if orc.energy < 20.0 { Color::Red } else if orc.energy < 50.0 { Color::Yellow } else { Color::Cyan };
+        let thirst_color = if orc.thirst > 70.0 { Color::Red } else if orc.thirst > 40.0 { Color::Yellow } else { Color::Rgb(65, 105, 225) };
 
         items.push(ListItem::new(vec![
             Line::from(vec![
@@ -166,14 +198,24 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(format!(" ({})", orc.activity.label()), Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(vec![
-                Span::raw("    Hun "),
+                Span::raw("   HP "),
+                Span::styled(health_bar, Style::default().fg(health_color)),
+                Span::styled(format!(" {:.0}", orc.health), Style::default().fg(health_color)),
+            ]),
+            Line::from(vec![
+                Span::raw("   Hun"),
                 Span::styled(hunger_bar, Style::default().fg(hunger_color)),
                 Span::styled(format!(" {:.0}", orc.hunger), Style::default().fg(hunger_color)),
             ]),
             Line::from(vec![
-                Span::raw("    Nrg "),
+                Span::raw("   Nrg"),
                 Span::styled(energy_bar, Style::default().fg(energy_color)),
                 Span::styled(format!(" {:.0}", orc.energy), Style::default().fg(energy_color)),
+            ]),
+            Line::from(vec![
+                Span::raw("   H2O"),
+                Span::styled(thirst_bar, Style::default().fg(thirst_color)),
+                Span::styled(format!(" {:.0}", orc.thirst), Style::default().fg(thirst_color)),
             ]),
             Line::raw(""),
         ]));

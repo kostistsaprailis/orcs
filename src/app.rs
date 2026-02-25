@@ -1,16 +1,21 @@
 use rand::rngs::ThreadRng;
+use rand::Rng;
 
+use crate::animal::{self, Animal};
 use crate::event::EventLog;
-use crate::orc::Orc;
+use crate::orc::{self, Orc};
 use crate::world::{MAP_HEIGHT, MAP_WIDTH, Terrain, World};
+
+const MAX_CLAN_SIZE: usize = 15;
 
 pub struct App {
     pub world: World,
     pub orcs: Vec<Orc>,
+    pub animals: Vec<Animal>,
     pub event_log: EventLog,
     pub tick: u64,
     pub paused: bool,
-    pub speed: u32, // 1 = normal, 2 = 2x, etc.
+    pub speed: u32,
     pub cursor_x: usize,
     pub cursor_y: usize,
     pub camera_x: usize,
@@ -25,6 +30,7 @@ impl App {
         let mut rng = rand::thread_rng();
         let world = World::generate(&mut rng);
         let orcs = Orc::spawn_clan(5, &world, &mut rng);
+        let animals = Animal::spawn_initial(&world, &mut rng);
         let mut event_log = EventLog::new();
 
         event_log.log(0, "A clan of orcs settles in a new land...".to_string(), ratatui::style::Color::White);
@@ -37,6 +43,7 @@ impl App {
         App {
             world,
             orcs,
+            animals,
             event_log,
             tick: 0,
             paused: false,
@@ -53,7 +60,7 @@ impl App {
 
     pub fn is_night(&self) -> bool {
         let time_of_day = self.tick % 100;
-        time_of_day >= 60 // last 40% of day is night
+        time_of_day >= 60
     }
 
     pub fn tick(&mut self) {
@@ -74,12 +81,92 @@ impl App {
 
         let is_night = self.is_night();
 
-        // Update each orc (need to work around borrow checker)
+        // Update animals
+        let orc_positions: Vec<(usize, usize)> = self.orcs.iter()
+            .filter(|o| o.alive)
+            .map(|o| (o.x, o.y))
+            .collect();
+        for animal in &mut self.animals {
+            animal.update(&self.world, &orc_positions, &mut self.rng);
+        }
+
+        // Update each orc
         let num_orcs = self.orcs.len();
         for i in 0..num_orcs {
             let mut orc = std::mem::replace(&mut self.orcs[i], Orc::new(String::new(), 0, 0));
-            orc.update(&mut self.world, &mut self.rng, &mut self.event_log, self.tick, is_night);
+            orc.update(&mut self.world, &mut self.animals, &mut self.rng, &mut self.event_log, self.tick, is_night);
             self.orcs[i] = orc;
+        }
+
+        // Remove dead orcs after a few ticks (show tombstone briefly)
+        self.orcs.retain(|orc| {
+            if !orc.alive {
+                if let Some(death_tick) = orc.death_tick {
+                    return self.tick - death_tick < 20; // keep tombstone for 20 ticks
+                }
+            }
+            true
+        });
+
+        // Fix selected_orc index if orcs were removed
+        if let Some(idx) = self.selected_orc {
+            if idx >= self.orcs.len() {
+                self.selected_orc = if self.orcs.is_empty() { None } else { Some(self.orcs.len() - 1) };
+            }
+        }
+
+        // Remove dead animals
+        self.animals.retain(|a| a.alive);
+
+        // Animal respawn
+        animal::try_respawn(&mut self.animals, &self.world, &mut self.rng, self.tick);
+
+        // Bush regrowth
+        self.world.tick_regrowth(self.tick);
+
+        // Birth system - check every 300 ticks
+        if self.tick % 300 == 0 {
+            self.check_birth();
+        }
+    }
+
+    fn check_birth(&mut self) {
+        let living: Vec<&Orc> = self.orcs.iter().filter(|o| o.alive).collect();
+        let count = living.len();
+
+        if count < 2 || count >= MAX_CLAN_SIZE {
+            return;
+        }
+
+        let avg_hunger: f32 = living.iter().map(|o| o.hunger).sum::<f32>() / count as f32;
+        let avg_energy: f32 = living.iter().map(|o| o.energy).sum::<f32>() / count as f32;
+
+        // Birth conditions: well-fed, rested, have stockpile
+        if avg_hunger < 40.0 && avg_energy > 40.0 && self.world.food_stockpile > 0 {
+            self.world.food_stockpile -= 1;
+
+            let existing_names: Vec<String> = self.orcs.iter().map(|o| o.name.clone()).collect();
+            let name = orc::pick_name(&mut self.rng, &existing_names);
+
+            let (cx, cy) = self.world.campfire_pos;
+            let mut x = cx;
+            let mut y = cy;
+            for _ in 0..20 {
+                let nx = (cx as i32 + self.rng.gen_range(-2..=2)).clamp(0, MAP_WIDTH as i32 - 1) as usize;
+                let ny = (cy as i32 + self.rng.gen_range(-2..=2)).clamp(0, MAP_HEIGHT as i32 - 1) as usize;
+                if self.world.is_walkable(nx, ny) {
+                    x = nx;
+                    y = ny;
+                    break;
+                }
+            }
+
+            self.event_log.log(
+                self.tick,
+                format!("{} is born into the clan!", name),
+                ratatui::style::Color::LightGreen,
+            );
+            self.orcs.push(Orc::new(name, x, y));
         }
     }
 
@@ -90,7 +177,6 @@ impl App {
         self.cursor_y = ny;
     }
 
-    /// Center camera on cursor, clamped to map bounds
     pub fn update_camera(&mut self, viewport_w: usize, viewport_h: usize) {
         let half_w = viewport_w / 2;
         let half_h = viewport_h / 2;
@@ -129,16 +215,27 @@ impl App {
     }
 
     pub fn cycle_selected_orc(&mut self) {
+        let living: Vec<usize> = self.orcs.iter().enumerate()
+            .filter(|(_, o)| o.alive)
+            .map(|(i, _)| i)
+            .collect();
+
+        if living.is_empty() {
+            self.selected_orc = None;
+            return;
+        }
+
         self.selected_orc = match self.selected_orc {
-            None => Some(0),
-            Some(i) => {
-                if i + 1 >= self.orcs.len() {
-                    None
-                } else {
-                    Some(i + 1)
+            None => Some(living[0]),
+            Some(current) => {
+                let pos = living.iter().position(|&i| i == current);
+                match pos {
+                    Some(p) if p + 1 < living.len() => Some(living[p + 1]),
+                    _ => None,
                 }
             }
         };
+
         // Snap cursor to selected orc
         if let Some(i) = self.selected_orc {
             self.cursor_x = self.orcs[i].x;
