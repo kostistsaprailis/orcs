@@ -39,7 +39,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
 
     loop {
         // Render
-        terminal.draw(|frame| render::render(frame, &app))?;
+        terminal.draw(|frame| render::render(frame, &mut app))?;
 
         // Handle input with timeout
         let tick_rate = Duration::from_millis(app.tick_interval_ms());

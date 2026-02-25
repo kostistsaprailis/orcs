@@ -13,6 +13,8 @@ pub struct App {
     pub speed: u32, // 1 = normal, 2 = 2x, etc.
     pub cursor_x: usize,
     pub cursor_y: usize,
+    pub camera_x: usize,
+    pub camera_y: usize,
     pub selected_orc: Option<usize>,
     pub should_quit: bool,
     rng: ThreadRng,
@@ -41,6 +43,8 @@ impl App {
             speed: 1,
             cursor_x: cx,
             cursor_y: cy,
+            camera_x: 0,
+            camera_y: 0,
             selected_orc: None,
             should_quit: false,
             rng,
@@ -86,6 +90,28 @@ impl App {
         self.cursor_y = ny;
     }
 
+    /// Center camera on cursor, clamped to map bounds
+    pub fn update_camera(&mut self, viewport_w: usize, viewport_h: usize) {
+        let half_w = viewport_w / 2;
+        let half_h = viewport_h / 2;
+
+        self.camera_x = if self.cursor_x < half_w {
+            0
+        } else if self.cursor_x + half_w >= MAP_WIDTH {
+            MAP_WIDTH.saturating_sub(viewport_w)
+        } else {
+            self.cursor_x - half_w
+        };
+
+        self.camera_y = if self.cursor_y < half_h {
+            0
+        } else if self.cursor_y + half_h >= MAP_HEIGHT {
+            MAP_HEIGHT.saturating_sub(viewport_h)
+        } else {
+            self.cursor_y - half_h
+        };
+    }
+
     pub fn toggle_pause(&mut self) {
         self.paused = !self.paused;
     }
@@ -113,6 +139,11 @@ impl App {
                 }
             }
         };
+        // Snap cursor to selected orc
+        if let Some(i) = self.selected_orc {
+            self.cursor_x = self.orcs[i].x;
+            self.cursor_y = self.orcs[i].y;
+        }
     }
 
     pub fn drop_food(&mut self) {

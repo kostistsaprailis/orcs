@@ -1,7 +1,7 @@
 use rand::Rng;
 
-pub const MAP_WIDTH: usize = 50;
-pub const MAP_HEIGHT: usize = 30;
+pub const MAP_WIDTH: usize = 300;
+pub const MAP_HEIGHT: usize = 150;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Terrain {
@@ -16,12 +16,12 @@ pub enum Terrain {
 impl Terrain {
     pub fn symbol(&self) -> char {
         match self {
-            Terrain::Grass => '.',
-            Terrain::Tree => 'T',
-            Terrain::Rock => '#',
-            Terrain::Water => '~',
-            Terrain::Campfire => '*',
-            Terrain::Food => '%',
+            Terrain::Grass => '·',
+            Terrain::Tree => '♣',
+            Terrain::Rock => '◆',
+            Terrain::Water => '≈',
+            Terrain::Campfire => '♨',
+            Terrain::Food => '⚘',
         }
     }
 
@@ -36,30 +36,30 @@ impl Terrain {
         use ratatui::style::Color;
         match self {
             Terrain::Grass => Color::DarkGray,
-            Terrain::Tree => Color::Green,
+            Terrain::Tree => Color::Rgb(34, 139, 34),
             Terrain::Rock => Color::Gray,
-            Terrain::Water => Color::Blue,
-            Terrain::Campfire => Color::Yellow,
-            Terrain::Food => Color::Magenta,
+            Terrain::Water => Color::Rgb(65, 105, 225),
+            Terrain::Campfire => Color::Rgb(255, 140, 0),
+            Terrain::Food => Color::Rgb(255, 100, 180),
         }
     }
 }
 
 pub struct World {
-    pub tiles: [[Terrain; MAP_WIDTH]; MAP_HEIGHT],
+    pub tiles: Vec<Vec<Terrain>>,
     pub campfire_pos: (usize, usize),
 }
 
 impl World {
     pub fn generate(rng: &mut impl Rng) -> Self {
-        let mut tiles = [[Terrain::Grass; MAP_WIDTH]; MAP_HEIGHT];
+        let mut tiles = vec![vec![Terrain::Grass; MAP_WIDTH]; MAP_HEIGHT];
 
         // Place campfire near center
         let cx = MAP_WIDTH / 2;
         let cy = MAP_HEIGHT / 2;
         tiles[cy][cx] = Terrain::Campfire;
 
-        // Scatter trees (about 12% of tiles)
+        // Scatter trees and rocks
         for y in 0..MAP_HEIGHT {
             for x in 0..MAP_WIDTH {
                 if tiles[y][x] != Terrain::Grass {
@@ -79,16 +79,18 @@ impl World {
             }
         }
 
-        // Place a small pond
-        let wx = rng.gen_range(5..MAP_WIDTH - 5);
-        let wy = rng.gen_range(5..MAP_HEIGHT - 5);
-        for dy in 0..3 {
-            for dx in 0..4 {
-                let y = wy + dy;
-                let x = wx + dx;
-                if y < MAP_HEIGHT && x < MAP_WIDTH {
-                    // Don't overwrite campfire
-                    if tiles[y][x] != Terrain::Campfire {
+        // Place several ponds scattered across the map
+        let num_ponds = rng.gen_range(6..12);
+        for _ in 0..num_ponds {
+            let wx = rng.gen_range(5..MAP_WIDTH - 10);
+            let wy = rng.gen_range(5..MAP_HEIGHT - 8);
+            let pw = rng.gen_range(3..8);
+            let ph = rng.gen_range(2..5);
+            for dy in 0..ph {
+                for dx in 0..pw {
+                    let y = wy + dy;
+                    let x = wx + dx;
+                    if y < MAP_HEIGHT && x < MAP_WIDTH && tiles[y][x] != Terrain::Campfire {
                         tiles[y][x] = Terrain::Water;
                     }
                 }

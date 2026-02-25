@@ -2,18 +2,18 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph};
 
 use crate::app::App;
 use crate::orc::Activity;
 use crate::world::{MAP_HEIGHT, MAP_WIDTH};
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     // Main layout: map on left, sidebar on right
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Min(MAP_WIDTH as u16 + 2),
+            Constraint::Min(20),
             Constraint::Length(30),
         ])
         .split(frame.area());
@@ -22,7 +22,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(MAP_HEIGHT as u16 + 2),
+            Constraint::Min(10),
             Constraint::Length(10),
         ])
         .split(main_chunks[0]);
@@ -32,18 +32,28 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_sidebar(frame, app, main_chunks[1]);
 }
 
-fn render_map(frame: &mut Frame, app: &App, area: Rect) {
-    let night_dim = if app.is_night() { true } else { false };
+fn render_map(frame: &mut Frame, app: &mut App, area: Rect) {
+    let night_dim = app.is_night();
+
+    // Viewport dimensions (inside borders)
+    let vw = (area.width.saturating_sub(2)) as usize;
+    let vh = (area.height.saturating_sub(2)) as usize;
+
+    // Update camera to center on cursor
+    app.update_camera(vw, vh);
+
+    let cam_x = app.camera_x;
+    let cam_y = app.camera_y;
 
     let mut lines: Vec<Line> = Vec::new();
-    for y in 0..MAP_HEIGHT {
+    for y in cam_y..(cam_y + vh).min(MAP_HEIGHT) {
         let mut spans: Vec<Span> = Vec::new();
-        for x in 0..MAP_WIDTH {
+        for x in cam_x..(cam_x + vw).min(MAP_WIDTH) {
             // Check if an orc is here
             if let Some(orc) = app.orcs.iter().find(|o| o.x == x && o.y == y) {
                 let orc_char = match &orc.activity {
-                    Activity::Sleeping => 'o', // lowercase when sleeping
-                    _ => 'O',
+                    Activity::Sleeping => '◎',
+                    _ => '☻',
                 };
                 let selected = app.selected_orc.is_some_and(|i| {
                     app.orcs[i].x == x && app.orcs[i].y == y
@@ -58,7 +68,7 @@ fn render_map(frame: &mut Frame, app: &App, area: Rect) {
             } else if app.cursor_x == x && app.cursor_y == y {
                 // Cursor
                 spans.push(Span::styled(
-                    "X",
+                    "▣",
                     Style::default().fg(Color::White).add_modifier(Modifier::REVERSED),
                 ));
             } else {
@@ -79,17 +89,20 @@ fn render_map(frame: &mut Frame, app: &App, area: Rect) {
     let time_label = if app.is_night() { "Night" } else { "Day" };
     let day_num = app.tick / 100 + 1;
     let title = format!(
-        " Orc Village | Day {} ({}) | Tick {} | Speed: {}x {} ",
+        " Orc Village | Day {} ({}) | Tick {} | Speed: {}x {} | ({},{}) ",
         day_num,
         time_label,
         app.tick,
         app.speed,
-        if app.paused { "[PAUSED]" } else { "" }
+        if app.paused { "[PAUSED]" } else { "" },
+        app.cursor_x,
+        app.cursor_y,
     );
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if app.is_night() { Color::DarkGray } else { Color::White }));
 
     let map_widget = Paragraph::new(lines).block(block);
@@ -117,6 +130,7 @@ fn render_event_log(frame: &mut Frame, app: &App, area: Rect) {
         Block::default()
             .title(" Events ")
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     frame.render_widget(list, area);
@@ -169,6 +183,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         Block::default()
             .title(" Clan ")
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Green)),
     );
     frame.render_widget(orc_list, chunks[0]);
@@ -186,24 +201,26 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let help = Paragraph::new(help_text).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     frame.render_widget(help, chunks[1]);
 }
 
 fn bar(value: f32, max: f32, width: usize) -> String {
-    let filled = ((value / max) * width as f32).round() as usize;
-    let empty = width.saturating_sub(filled);
-    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+    let ratio = value / max;
+    let filled = (ratio * width as f32).floor() as usize;
+    let remainder = (ratio * width as f32) - filled as f32;
+    let has_transition = filled < width && remainder > 0.3;
+    let empty = width.saturating_sub(filled).saturating_sub(if has_transition { 1 } else { 0 });
+    let transition = if has_transition { "▒" } else { "" };
+    format!("[{}{}{}]", "▓".repeat(filled), transition, "░".repeat(empty))
 }
 
 fn dim_color(color: Color) -> Color {
     match color {
-        Color::Green => Color::DarkGray,
-        Color::Blue => Color::DarkGray,
-        Color::Yellow => Color::Rgb(100, 80, 0),
+        Color::Rgb(r, g, b) => Color::Rgb(r / 3, g / 3, b / 3),
         Color::Gray => Color::DarkGray,
-        Color::Magenta => Color::Rgb(80, 0, 80),
         _ => Color::DarkGray,
     }
 }
