@@ -2,6 +2,7 @@ mod animal;
 mod app;
 mod event;
 mod orc;
+mod pathfinding;
 mod render;
 mod world;
 

@@ -128,6 +128,12 @@ impl App {
         if self.tick % 300 == 0 {
             self.check_birth();
         }
+
+        // Game over if all orcs are gone
+        if self.orcs.is_empty() {
+            self.event_log.log(self.tick, "The clan has perished...".to_string(), ratatui::style::Color::Red);
+            self.paused = true;
+        }
     }
 
     fn check_birth(&mut self) {

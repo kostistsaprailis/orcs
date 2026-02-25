@@ -2,6 +2,7 @@ use rand::Rng;
 
 use crate::animal::Animal;
 use crate::event::EventLog;
+use crate::pathfinding;
 use crate::world::{MAP_HEIGHT, MAP_WIDTH, Terrain, World};
 
 const ORC_NAMES: &[&str] = &[
@@ -39,15 +40,17 @@ pub struct Orc {
     pub name: String,
     pub x: usize,
     pub y: usize,
-    pub hunger: f32,    // 0 = full, 100 = starving
-    pub energy: f32,    // 0 = exhausted, 100 = fully rested
-    pub thirst: f32,    // 0 = hydrated, 100 = dehydrated
-    pub health: f32,    // 100 = healthy, 0 = dead
+    pub hunger: f32,
+    pub energy: f32,
+    pub thirst: f32,
+    pub health: f32,
     pub alive: bool,
-    pub death_tick: Option<u64>, // tick when died (for rendering tombstone)
+    pub death_tick: Option<u64>,
     pub activity: Activity,
     idle_ticks: u32,
     pub carrying_food: bool,
+    path: Vec<(usize, usize)>, // A* computed waypoints
+    path_step: usize,
 }
 
 impl Orc {
@@ -65,6 +68,8 @@ impl Orc {
             activity: Activity::Idle,
             idle_ticks: 0,
             carrying_food: false,
+            path: Vec::new(),
+            path_step: 0,
         }
     }
 
@@ -76,7 +81,6 @@ impl Orc {
             let name = pick_name(rng, &used_names);
             used_names.push(name.clone());
 
-            // Spawn near campfire
             let (cx, cy) = world.campfire_pos;
             loop {
                 let x = cx.saturating_sub(3) + rng.gen_range(0..7);
@@ -91,6 +95,38 @@ impl Orc {
         }
 
         orcs
+    }
+
+    /// Compute and store an A* path to the target
+    fn plan_path(&mut self, tx: usize, ty: usize, world: &World, allow_tree: bool) {
+        if let Some(p) = pathfinding::find_path(world, self.x, self.y, tx, ty, allow_tree) {
+            self.path = p;
+            self.path_step = 0;
+        } else {
+            // No path found — clear and rely on fallback
+            self.path.clear();
+            self.path_step = 0;
+        }
+    }
+
+    /// Follow the stored A* path. Returns true if moved, false if path exhausted.
+    fn follow_path(&mut self) -> bool {
+        if self.path_step < self.path.len() {
+            let (nx, ny) = self.path[self.path_step];
+            self.x = nx;
+            self.y = ny;
+            self.path_step += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set a GoingTo activity and compute the path
+    fn go_to(&mut self, x: usize, y: usize, reason: String, world: &World) {
+        let allow_tree = matches!(world.get(x, y), Terrain::Tree | Terrain::Bush);
+        self.plan_path(x, y, world, allow_tree);
+        self.activity = Activity::GoingTo { x, y, reason };
     }
 
     pub fn update(
@@ -143,11 +179,7 @@ impl Orc {
         if self.health <= 0.0 {
             self.alive = false;
             self.death_tick = Some(tick);
-            log.log(
-                tick,
-                format!("{} has died!", self.name),
-                ratatui::style::Color::Red,
-            );
+            log.log(tick, format!("{} has died!", self.name), ratatui::style::Color::Red);
             return;
         }
 
@@ -179,26 +211,32 @@ impl Orc {
                     let (ax, ay) = (animals[idx].x, animals[idx].y);
                     let dist = self.x.abs_diff(ax) + self.y.abs_diff(ay);
                     if dist <= 1 {
-                        // Kill the animal
                         animals[idx].kill(world, log, tick);
                         log.log(tick, format!("{} caught a {}!", self.name, animals[idx].kind.name()), ratatui::style::Color::Green);
                         if self.hunger > 50.0 {
-                            // Eat immediately
                             self.activity = Activity::Eating;
                         } else {
-                            // Carry meat to stockpile
                             self.carrying_food = true;
                             self.activity = Activity::CarryingMeat;
-                            // Pick up the food tile
                             if world.get(ax, ay) == Terrain::Food {
                                 world.set(ax, ay, Terrain::Grass);
                             }
+                            // Plan path to meat rack
+                            if let Some((mx, my)) = world.meat_rack_pos() {
+                                self.plan_path(mx, my, world, false);
+                            }
                         }
                     } else {
-                        self.move_toward(ax, ay, world, rng);
+                        // Recompute path to moving target every few steps
+                        if self.path.is_empty() || self.path_step >= self.path.len() {
+                            self.plan_path(ax, ay, world, false);
+                        }
+                        if !self.follow_path() {
+                            // Fallback: greedy move
+                            self.move_toward_greedy(ax, ay, world, rng);
+                        }
                     }
                 } else {
-                    // Target gone
                     self.activity = Activity::Idle;
                 }
             }
@@ -210,11 +248,10 @@ impl Orc {
                         self.carrying_food = false;
                         log.log(tick, format!("{} stored meat (stockpile: {})", self.name, world.food_stockpile), ratatui::style::Color::Rgb(180, 120, 60));
                         self.activity = Activity::Idle;
-                    } else {
-                        self.move_toward(mx, my, world, rng);
+                    } else if !self.follow_path() {
+                        self.move_toward_greedy(mx, my, world, rng);
                     }
                 } else {
-                    // No meat rack, just drop it
                     self.carrying_food = false;
                     self.activity = Activity::Idle;
                 }
@@ -223,8 +260,9 @@ impl Orc {
                 let (tx, ty) = (*x, *y);
                 if self.x == tx && self.y == ty {
                     self.arrive_at_destination(world, log, tick);
-                } else {
-                    self.move_toward(tx, ty, world, rng);
+                } else if !self.follow_path() {
+                    // Path exhausted or failed — fallback to greedy
+                    self.move_toward_greedy(tx, ty, world, rng);
                 }
             }
             Activity::Idle => {
@@ -255,7 +293,6 @@ impl Orc {
             log.log(tick, format!("{} drinks water", self.name), ratatui::style::Color::Rgb(65, 105, 225));
             self.activity = Activity::Drinking;
         } else {
-            // Near campfire to sleep
             log.log(tick, format!("{} lies down to sleep by the fire", self.name), ratatui::style::Color::Blue);
             self.activity = Activity::Sleeping;
         }
@@ -272,24 +309,24 @@ impl Orc {
     ) {
         let (cx, cy) = world.campfire_pos;
 
-        // Priority 1: Health critical — rush to address worst need
+        // Priority 1: Health critical
         if self.health < 20.0 {
             if self.thirst > self.hunger && self.thirst > (100.0 - self.energy) {
                 if let Some((wx, wy)) = world.find_water_adjacent(self.x, self.y) {
                     log.log(tick, format!("{} desperately needs water!", self.name), ratatui::style::Color::Red);
-                    self.activity = Activity::GoingTo { x: wx, y: wy, reason: "Desperate for water".to_string() };
+                    self.go_to(wx, wy, "Desperate for water".to_string(), world);
                     return;
                 }
             } else if self.hunger > (100.0 - self.energy) {
                 if let Some(target) = self.find_food_target(world, animals) {
                     log.log(tick, format!("{} desperately needs food!", self.name), ratatui::style::Color::Red);
-                    self.activity = target;
+                    self.set_activity_with_path(target, world);
                     return;
                 }
             } else {
                 let (sx, sy) = self.find_spot_near(cx, cy, world, rng);
                 log.log(tick, format!("{} desperately needs rest!", self.name), ratatui::style::Color::Red);
-                self.activity = Activity::GoingTo { x: sx, y: sy, reason: "Desperate for sleep".to_string() };
+                self.go_to(sx, sy, "Desperate for sleep".to_string(), world);
                 return;
             }
         }
@@ -298,7 +335,7 @@ impl Orc {
         if self.thirst > 60.0 {
             if let Some((wx, wy)) = world.find_water_adjacent(self.x, self.y) {
                 log.log(tick, format!("{} is thirsty, heading to water", self.name), ratatui::style::Color::Yellow);
-                self.activity = Activity::GoingTo { x: wx, y: wy, reason: "Going to drink".to_string() };
+                self.go_to(wx, wy, "Going to drink".to_string(), world);
                 return;
             }
         }
@@ -307,7 +344,7 @@ impl Orc {
         if self.hunger > 70.0 {
             if let Some(target) = self.find_food_target(world, animals) {
                 log.log(tick, format!("{} is hungry, looking for food", self.name), ratatui::style::Color::Yellow);
-                self.activity = target;
+                self.set_activity_with_path(target, world);
                 return;
             }
         }
@@ -316,17 +353,20 @@ impl Orc {
         if self.energy < 20.0 {
             let (sx, sy) = self.find_spot_near(cx, cy, world, rng);
             log.log(tick, format!("{} is exhausted, heading to campfire", self.name), ratatui::style::Color::Yellow);
-            self.activity = Activity::GoingTo { x: sx, y: sy, reason: "Going to sleep".to_string() };
+            self.go_to(sx, sy, "Going to sleep".to_string(), world);
             return;
         }
 
-        // Priority 5: Carrying meat -> stockpile
+        // Priority 5: Carrying meat
         if self.carrying_food {
             self.activity = Activity::CarryingMeat;
+            if let Some((mx, my)) = world.meat_rack_pos() {
+                self.plan_path(mx, my, world, false);
+            }
             return;
         }
 
-        // Priority 6: Wander (stay within ~30 tiles of campfire)
+        // Priority 6: Wander
         self.idle_ticks += 1;
         if self.idle_ticks > 3 {
             self.idle_ticks = 0;
@@ -338,17 +378,30 @@ impl Orc {
                 .clamp(cy as i32 - max_dist, cy as i32 + max_dist)
                 .clamp(0, MAP_HEIGHT as i32 - 1) as usize;
             if world.is_walkable(nx, ny) {
-                self.activity = Activity::GoingTo {
-                    x: nx,
-                    y: ny,
-                    reason: "Wandering".to_string(),
-                };
+                self.go_to(nx, ny, "Wandering".to_string(), world);
             }
         }
     }
 
+    /// Set an activity that may be GoingTo or Hunting, computing path if needed
+    fn set_activity_with_path(&mut self, activity: Activity, world: &World) {
+        match &activity {
+            Activity::GoingTo { x, y, .. } => {
+                let (tx, ty) = (*x, *y);
+                let allow_tree = matches!(world.get(tx, ty), Terrain::Tree | Terrain::Bush);
+                self.plan_path(tx, ty, world, allow_tree);
+            }
+            Activity::Hunting { .. } => {
+                // Hunting paths are recomputed dynamically since the target moves
+                self.path.clear();
+                self.path_step = 0;
+            }
+            _ => {}
+        }
+        self.activity = activity;
+    }
+
     fn find_food_target(&self, world: &World, animals: &[Animal]) -> Option<Activity> {
-        // Check stockpile first
         if world.food_stockpile > 0 {
             if let Some((mx, my)) = world.meat_rack_pos() {
                 return Some(Activity::GoingTo {
@@ -358,14 +411,10 @@ impl Orc {
             }
         }
 
-        // Find nearest bush
         let bush = world.find_nearest(self.x, self.y, Terrain::Bush);
-        // Find nearest food on ground
         let food = world.find_nearest(self.x, self.y, Terrain::Food);
-        // Find nearest tree (worst option)
         let tree = world.find_nearest(self.x, self.y, Terrain::Tree);
 
-        // Pick closest food source
         let mut best: Option<(usize, usize, usize)> = None;
         for target in [bush, food, tree].iter().flatten() {
             let dist = self.x.abs_diff(target.0) + self.y.abs_diff(target.1);
@@ -374,14 +423,12 @@ impl Orc {
             }
         }
 
-        // Also consider hunting an animal if it's close
         let nearest_animal = animals.iter().enumerate()
             .filter(|(_, a)| a.alive)
             .min_by_key(|(_, a)| self.x.abs_diff(a.x) + self.y.abs_diff(a.y));
 
         if let Some((idx, animal)) = nearest_animal {
             let animal_dist = self.x.abs_diff(animal.x) + self.y.abs_diff(animal.y);
-            // Hunt if animal is reasonably close or no other food source
             if best.is_none() || animal_dist < 15 {
                 return Some(Activity::Hunting { target_idx: idx });
             }
@@ -402,7 +449,8 @@ impl Orc {
         })
     }
 
-    fn move_toward(&mut self, tx: usize, ty: usize, world: &World, rng: &mut impl Rng) {
+    /// Greedy fallback when A* path is unavailable or exhausted
+    fn move_toward_greedy(&mut self, tx: usize, ty: usize, world: &World, rng: &mut impl Rng) {
         let dx = (tx as i32 - self.x as i32).signum();
         let dy = (ty as i32 - self.y as i32).signum();
 
@@ -441,7 +489,6 @@ impl Orc {
 pub fn pick_name(rng: &mut impl Rng, existing: &[String]) -> String {
     let available: Vec<&&str> = ORC_NAMES.iter().filter(|n| !existing.iter().any(|e| e == **n)).collect();
     if available.is_empty() {
-        // Generate a random name if all are taken
         let prefix = ["Gr", "Th", "Kr", "Br", "Dr", "Sk", "Zn", "Gl"];
         let suffix = ["ok", "ag", "ug", "ak", "im", "oz", "ur", "ash"];
         format!(
